@@ -296,15 +296,33 @@ stopwords from the documents too and stop matching query words that stoplist
 keeps.
 
 Two things about the ported blend are worth knowing before reading a score.
-Postgres has no BM25: `ts_rank` is a different formula on a different scale,
-measured at about one part in 150 of what FTS5's `bm25()` returns, so it is
-rescaled into that range — the figure is added to the combined score with a
-fixed coefficient and rendered into every mind's injected context, and a
-field that kept its name while changing magnitude by two orders would read as
-the same number meaning something else. And the pool sizes, the slot
-allocation and the decay are lucent's own constants, carried across
-unchanged; `docs/memory-search-parity.md` is the measured comparison, and
-`tools/memory_search_parity.py` regenerates it.
+Postgres has no BM25, and `ts_rank` is not a rescaled BM25 — it is bounded
+below 1 where `bm25()` is unbounded, so no single multiplier maps one onto
+the other for every query. Measured over the live corpus the ratio runs from
+about 90 to about 540; `KEYWORD_SCALE` is the median, because the alternative
+is not "no scaling" but a silent change of magnitude in two places that both
+matter: the figure is added to the combined score with a fixed coefficient,
+and it is rendered as `bm=` into every mind's injected context every turn.
+Within a factor of two of the old magnitude is the goal; exact is not
+available. The report prints the per-query ratio so the constant can be
+checked rather than believed.
+
+And the pool sizes, the slot allocation and the decay are lucent's own
+constants, carried across unchanged — including one that is carried
+deliberately rather than approvingly: the keyword candidate limit is applied
+across the whole store and the provenance filter after it, so a mind holding
+few rows gets fewer candidates than the pool is sized for. Filtering first
+is a better answer and a different one, which a story that ports the blend
+unchanged does not get to make.
+
+`docs/memory-search-parity.md` is the measured comparison and
+`tools/memory_search_parity.py` regenerates it. It snapshots the live store
+through SQLite's own backup API into a 0700 directory it removes afterwards,
+creates and drops its own Postgres database, and scopes both engines the way
+the live caller scopes them. Run it with hive_mind's interpreter: it imports
+lucent's own recall rather than a reimplementation of it, and the embedding
+is computed once per query and handed to both sides, so a difference in the
+answers is a difference in the search.
 
 An install that runs none of this is unaffected. A database with no `memory`
 schema opens normally — that is comms, which needs `core` and nothing else —

@@ -67,9 +67,21 @@ async def _register_codecs(connection: Any) -> None:
     open a pool for it would make a memory-side type decision break every
     service in the hive.
     """
+    # The schema is asked for rather than assumed. `set_type_codec` resolves
+    # a type by (schema, name), and `CREATE EXTENSION vector` lands wherever
+    # `search_path` pointed when somebody ran it. Hardcoding `public` meant a
+    # database with the extension anywhere else registered no codec at all
+    # and said nothing — and the startup type check passes there, because
+    # `udt_name` is just `vector` in any schema.
+    where = await connection.fetchval(
+        "SELECT n.nspname FROM pg_type t "
+        "JOIN pg_namespace n ON n.oid = t.typnamespace "
+        "WHERE t.typname = 'vector'")
+    if where is None:
+        return
     try:
         await connection.set_type_codec(
-            "vector", schema="public",
+            "vector", schema=where,
             encoder=_vector_literal, decoder=_vector_values,
             format="text")
     except (asyncpg.exceptions.UndefinedObjectError, ValueError):

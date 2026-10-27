@@ -22,6 +22,7 @@ evidence, and its own story.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import time
@@ -29,9 +30,13 @@ from typing import Any, Mapping, Sequence
 
 from . import _sql
 from .core import _execute, _execute_returning, _fetch, _fetch_one
-from .errors import ValueRefused
+from .errors import HiveDataError, ValueRefused
+from .rows import UNSET
+from .schema import public as schema_public
 from .schema import qualified, select_list
 from .unit import Unit
+
+log = logging.getLogger("hive-data")
 
 #: lucent's own, unchanged. A memory's score decays with a 30-day half-life
 #: and never falls below half, so recency is a bounded multiplier on
@@ -52,23 +57,24 @@ DEFAULT_K = 5
 KEYWORD_SCAN = KEYWORD_POOL * 4
 
 #: Postgres has no BM25, and `ts_rank` is not a rescaled BM25 - it is a
-#: different formula on a different scale. Measured over the live corpus
-#: with a real three-token query: FTS5's `-bm25()` returns 6.4 to 8.8, and
-#: `ts_rank` over the same query returns 0.040 to 0.061. Roughly 150 to 1.
+#: different formula with a different shape. `ts_rank` is bounded below 1 and
+#: `bm25()` is not bounded at all, so no single multiplier can map one onto
+#: the other for every query. Measured over the live corpus with the ten real
+#: queries in `tools/memory_search_parity.py`, which reports the ratio per
+#: query so this number can be checked rather than believed: it runs from
+#: roughly 90 to roughly 540, and the median is what is used here.
 #:
-#: That ratio is load-bearing in two places and invisible in both. The
-#: backfill below adds `0.05 * keyword` to `cosine * recency`, so at FTS5's
-#: scale the keyword term contributes about 0.37 against a combined score of
-#: 0.2 to 0.8 - real weight - and at `ts_rank`'s scale it contributes 0.0025,
-#: which is nothing. And the `bm` figure is rendered into the model's
-#: injected context every turn by the contextual-retrieval hook, so a field
-#: that kept its name and changed its magnitude by two orders would read as
-#: the same number meaning something else.
+#: An approximation is still worth having, because the alternative is not
+#: "no scaling" - it is a silent change of magnitude in two places. The
+#: backfill ranking below adds `0.05 * keyword` to `cosine * recency`, which
+#: at FTS5's scale is real weight against a combined score of 0.2 to 0.8 and
+#: at `ts_rank`'s raw scale is 0.003, which is nothing. And the figure is
+#: rendered as `bm=` into every mind's injected context every turn by the
+#: contextual-retrieval hook. Being within a factor of two of the magnitude
+#: those were written against is the goal; being exact is not available.
 #:
-#: Monotonic, so nothing about the ordering within the keyword bucket
-#: changes; this only restores the magnitude the surrounding arithmetic and
-#: the hook were written against.
-KEYWORD_SCALE = 150.0
+#: Monotonic, so nothing about the ordering within the keyword bucket moves.
+KEYWORD_SCALE = 264.0
 
 #: The text search configuration the searchable column is built with. Named
 #: here as the schema declares it, because a query has to be parsed with the
@@ -92,9 +98,37 @@ STOPWORDS = frozenset({
     "no", "not", "yes", "ok", "okay",
 })
 
-#: Every column a recall hands back, in lucent's own order. `content_search`
-#: is declared private and so is never among them.
+#: What a read hands back. `content_search` and `embedding` are both declared
+#: private, so neither is in it.
+#:
+#: The embedding being private is not a detail. lucent builds its result rows
+#: by hand and has never returned one, and a `recall` that did would hand
+#: back 4096 floats per row - measured at 240KB for five rows, crossing the
+#: wire as a text literal and parsed back into floats one at a time, which is
+#: four times the cost of the scan doing it in the database was supposed to
+#: save. The contextual-retrieval hook calls this every turn.
 _READ = select_list("memories")
+
+#: The keys lucent's hybrid answer carries, in its own order. A caller reading
+#: that answer by key sees exactly these; `recurring` is not among them,
+#: because lucent's row-building code does not name it.
+_RECALL_KEYS = (
+    "id", "content", "tags", "source", "mind_id", "created_at", "data_class",
+    "tier", "as_of", "expires_at", "superseded", "codebase_ref",
+)
+
+
+def _as_lucent_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One row in the shape lucent's callers read.
+
+    `superseded` as a boolean rather than the column's `bigint`: lucent
+    returns `bool(...)` or `None`, and a reader testing it for truth cannot
+    tell 0 from False but a reader comparing it to `False` can.
+    """
+    out = {key: row.get(key) for key in _RECALL_KEYS}
+    flag = out.get("superseded")
+    out["superseded"] = None if flag is None else bool(flag)
+    return out
 
 
 def terms(query: str) -> list[str]:
@@ -109,6 +143,15 @@ def terms(query: str) -> list[str]:
     return [t for t in found if len(t) > 2 and t not in STOPWORDS]
 
 
+#: How many of a query's words are searched for. A pasted transcript is a
+#: query too, and `to_tsquery` parses an OR of 60,000 terms by recursive
+#: descent: measured, that one dies on `stack depth limit exceeded`, which
+#: arrives through the taxonomy as a rejected *write* on a read-only recall.
+#: lucent cannot hit it - FTS5 has no such limit - so a cap keeps the port
+#: from failing where the thing it replaces degrades.
+MAX_QUERY_TERMS = 200
+
+
 def _tsquery(query: str) -> str | None:
     """A query's words as an OR-joined tsquery, or None if it has none.
 
@@ -116,7 +159,7 @@ def _tsquery(query: str) -> str | None:
     token contributes to the ranking, and a memory matching one word of six
     is a candidate rather than a miss.
     """
-    found = terms(query)
+    found = terms(query)[:MAX_QUERY_TERMS]
     return " | ".join(found) if found else None
 
 
@@ -142,6 +185,18 @@ def _provenance(mind_id: str | None,
       provenance at all" here, and matches nothing.
     """
     if mind_ids is not None:
+        if isinstance(mind_ids, (str, bytes)):
+            # A `str` *is* a `Sequence[str]`, so no type checker catches
+            # this, and iterating one gives its characters: `"skippy"`
+            # becomes six one-letter minds and matches nothing. The caller
+            # gets an empty recall, which reads as "this mind has no
+            # memories about that" — a sentence a model will say out loud.
+            raise ValueRefused(
+                f"mind_ids was given the single name {mind_ids!r} rather "
+                "than a sequence of names. Iterating a string yields its "
+                "characters, which would scope the read to minds called "
+                "'s', 'k' and so on, and return nothing while looking like "
+                "an answer. Pass [name], or use mind_id.")
         names = [str(m).strip() for m in mind_ids if str(m or "").strip()]
         if not names:
             return "1 = 0", []
@@ -185,12 +240,12 @@ def _checked_query_vector(embedding: Sequence[float]) -> list[float]:
 
 async def store(*, mind_id: str, content: str,
                 embedding: Sequence[float] | None = None,
-                tags: str = "", source: str | None = None,
-                data_class: str | None = None, tier: str | None = None,
-                as_of: str | None = None, expires_at: str | None = None,
-                superseded: int | None = None, recurring: int | None = None,
-                codebase_ref: str | None = None,
-                created_at: int | None = None,
+                tags: Any = UNSET, source: Any = UNSET,
+                data_class: Any = UNSET, tier: Any = UNSET,
+                as_of: Any = UNSET, expires_at: Any = UNSET,
+                superseded: Any = UNSET, recurring: Any = UNSET,
+                codebase_ref: Any = UNSET,
+                created_at: Any = UNSET,
                 unit: Unit | None = None) -> dict[str, Any] | None:
     """Write a memory, and return the identity the database gave it.
 
@@ -201,7 +256,13 @@ async def store(*, mind_id: str, content: str,
     unsearchable - and nothing above this layer has to know how text search
     is configured.
     """
-    values = {
+    # `UNSET` rather than `None` for everything the caller did not name.
+    # The two are different writes and the package draws that line
+    # everywhere else: an unpassed `superseded` written as an explicit NULL
+    # overrides the column's own `DEFAULT 0`, so a memory stored through
+    # this layer reads back `None` where every row lucent wrote reads
+    # `False`.
+    values = _sql.passed({
         "mind_id": mind_id,
         "content": content,
         "embedding": None if embedding is None else [float(v)
@@ -216,16 +277,23 @@ async def store(*, mind_id: str, content: str,
         "recurring": recurring,
         "codebase_ref": codebase_ref,
         "created_at": created_at,
-    }
+    })
     sql, args = _sql.insert("memories", values, returning=("id",))
     return await _execute_returning(unit, sql, *args)
 
 
-async def get(memory_id: int, *,
+async def get(memory_id: int, *, embedding: bool = False,
               unit: Unit | None = None) -> dict[str, Any] | None:
-    """One memory by its identity."""
+    """One memory by its identity.
+
+    `embedding=True` asks for the vector as well. Off by default because it
+    is 4096 numbers and almost nothing wants them; the loader and anything
+    re-scoring an existing memory do.
+    """
+    columns = _READ if not embedding else select_list(
+        "memories", schema_public("memories") + ("embedding",))
     return await _fetch_one(
-        unit, f'SELECT {_READ} FROM {qualified("memories")} WHERE "id" = $1',
+        unit, f'SELECT {columns} FROM {qualified("memories")} WHERE "id" = $1',
         memory_id)
 
 
@@ -282,16 +350,30 @@ async def keyword(query: str, *, limit: int = KEYWORD_SCAN,
     if parsed is None:
         return []
     clause, args = _provenance(mind_id, mind_ids, 2)
-    conditions = [f'"content_search" @@ to_tsquery(\'{TEXT_CONFIG}\', $1)']
+    # The limit is applied ACROSS THE STORE and the provenance filter after
+    # it, which is lucent's order and not the better one. lucent asks FTS5
+    # for the global top `KEYWORD_SCAN` and then drops whatever does not
+    # belong to the minds being read, so a mind holding few rows can end up
+    # with fewer candidates than the pool is sized for. Filtering first
+    # would hand every mind the full pool - a strictly better answer, and a
+    # different one, which is not what a story that ports the blend
+    # unchanged gets to do. It is recorded on the story that judges the
+    # ranking instead.
+    inner = (f'SELECT "id", '
+             f'ts_rank("content_search", to_tsquery(\'{TEXT_CONFIG}\', $1)) '
+             f'* {KEYWORD_SCALE} AS "score" '
+             f'FROM {qualified("memories")} '
+             f'WHERE "content_search" @@ to_tsquery(\'{TEXT_CONFIG}\', $1) '
+             f'ORDER BY "score" DESC, "id" ASC '
+             f'LIMIT {int(limit)}')
+    conditions = ['m."id" = hit."id"']
     if clause:
-        conditions.append(clause)
-    sql = (f'SELECT {_READ}, '
-           f'ts_rank("content_search", to_tsquery(\'{TEXT_CONFIG}\', $1)) '
-           f'* {KEYWORD_SCALE} AS "score" '
-           f'FROM {qualified("memories")} '
-           f'WHERE {" AND ".join(conditions)} '
-           f'ORDER BY "score" DESC, "id" ASC '
-           f'LIMIT {int(limit)}')
+        conditions.append(clause.replace('"mind_id"', 'm."mind_id"'))
+    sql = (f'SELECT {", ".join(f"m.{c}" for c in _READ.split(", "))}, '
+           f'hit."score" '
+           f'FROM ({inner}) hit JOIN {qualified("memories")} m '
+           f'ON {" AND ".join(conditions)} '
+           f'ORDER BY hit."score" DESC, m."id" ASC')
     return await _fetch(unit, sql, parsed, *args)
 
 
@@ -328,6 +410,16 @@ async def recall(*, query: str, embedding: Sequence[float],
     k = max(1, min(k, 20))
     moment = time.time() if now is None else now
     values = _checked_query_vector(embedding)
+    if min_score is not None and math.isnan(float(min_score)):
+        # The same reasoning `_checked_query_vector` applies to the vector,
+        # applied to the threshold beside it: every comparison with NaN is
+        # false, so a NaN threshold filters nothing and the caller gets the
+        # unfiltered answer with no indication the limit they set was
+        # ignored. A config read or a division is how one arrives.
+        raise ValueRefused(
+            "a recall was given a min_score of NaN. Every comparison with "
+            "NaN is false, so the threshold would filter nothing and the "
+            "answer would look like one that had been filtered.")
 
     by_id: dict[int, dict[str, Any]] = {}
     cosine_scores: dict[int, float] = {}
@@ -338,8 +430,20 @@ async def recall(*, query: str, embedding: Sequence[float],
         by_id[int(row["id"])] = row
 
     keyword_scores: dict[int, float] = {}
-    for row in await keyword(query, limit=KEYWORD_SCAN, mind_id=mind_id,
-                             mind_ids=mind_ids, unit=unit):
+    # lucent wraps its whole FTS5 lookup and logs "continuing with
+    # vector-only" on any failure, so a query the keyword engine cannot
+    # parse still returns the memories the vector found. Carried across:
+    # without it, the port answers with an error where the thing it
+    # replaces answers with results. Not swallowed silently — it is logged,
+    # and it never hides a failure of the vector half, which is above.
+    try:
+        hits = await keyword(query, limit=KEYWORD_SCAN, mind_id=mind_id,
+                             mind_ids=mind_ids, unit=unit)
+    except HiveDataError:
+        log.warning("hive-data: the keyword half of a recall failed; "
+                    "answering on similarity alone", exc_info=True)
+        hits = []
+    for row in hits:
         row = dict(row)
         rid = int(row["id"])
         keyword_scores[rid] = float(row.pop("score"))
@@ -358,6 +462,16 @@ async def recall(*, query: str, embedding: Sequence[float],
             score = float(row["score"])
             if not math.isnan(score):
                 cosine_scores[int(row["id"])] = score
+    # A keyword hit whose row has no usable vector is dropped rather than
+    # scored zero. lucent builds its candidate set in the vector pass and
+    # skips any row whose embedding will not decode, and its keyword scores
+    # are only recorded for rows already in that set - so it can never
+    # return one. Scoring it 0.0 instead reads as "measured and distant"
+    # where the truth is "never measured", and it takes the keyword slot
+    # from a memory that was.
+    for rid in [r for r in keyword_scores if r not in cosine_scores]:
+        del keyword_scores[rid]
+        by_id.pop(rid, None)
 
     top_keyword = [
         rid for rid, _ in sorted(keyword_scores.items(),
@@ -436,7 +550,7 @@ async def recall(*, query: str, embedding: Sequence[float],
 
     out = []
     for bucket, entry in picks:
-        row = dict(entry["row"])
+        row = _as_lucent_row(entry["row"])
         if debug:
             row["debug"] = {
                 "bucket": bucket,

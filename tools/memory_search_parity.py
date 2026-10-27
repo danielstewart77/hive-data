@@ -38,8 +38,10 @@ import argparse
 import asyncio
 import datetime
 import os
+import shutil
 import sqlite3
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -58,6 +60,12 @@ LIVE_STORE = LUCENT_REPO / "data" / "lucent.db"
 #: The last three are the edges the port changes something about — a query
 #: whose words are all filler, a name carrying diacritics, and a word whose
 #: inflection differs from the one stored.
+#: Whose memories the comparison reads, as the live caller reads them: a
+#: mind's own plus the `shared` sentinel the hive-wide rules are written
+#: under. `MIND_ID` is this host's, from the environment the service gives
+#: it; a run without one falls back to the whole store and says so.
+SCOPE = [os.environ.get("MIND_ID", "").strip() or "shared", "shared"]
+
 QUERIES = [
     "rotation threshold for a terminal pane",
     "which voice engine speaks a mind",
@@ -175,8 +183,14 @@ async def main() -> int:
         print("HIVE_DATA_TEST_ADMIN_DSN is unset.", file=sys.stderr)
         return 2
 
-    work = Path("/tmp") / f"memory-parity-{uuid.uuid4().hex[:8]}"
-    work.mkdir(parents=True)
+    # 0700, and removed in the `finally` at the bottom whatever happens.
+    # The first version of this script left one 137MB copy of every memory
+    # in the hive — bloodwork, the kids' machines, every soul row — in a
+    # world-readable /tmp directory per run, and five of them accumulated
+    # in an afternoon. The module docstring's boast about never writing to
+    # the live store was true and beside the point.
+    work = Path(tempfile.mkdtemp(prefix="memory-parity-"))
+    work.chmod(0o700)
     snapshot = work / "lucent-snapshot.db"
     live_rows = _snapshot(snapshot)
     print(f"snapshot: {live_rows} memories", file=sys.stderr)
@@ -194,6 +208,27 @@ async def main() -> int:
     parts = urlsplit(admin_dsn)
     dsn = urlunsplit(parts._replace(path=f"/{name}"))
 
+    try:
+        return await _report(args, admin_dsn, dsn, name, work, snapshot,
+                             live_rows)
+    finally:
+        # Both of these used to sit inside a `try` that opened after the
+        # setup they were meant to protect, so a failure applying the schema
+        # or loading a row leaked the database and left the snapshot behind.
+        shutil.rmtree(work, ignore_errors=True)
+        if not args.keep:
+            admin = await asyncpg.connect(admin_dsn)
+            try:
+                await admin.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = $1 AND pid <> pg_backend_pid()", name)
+                await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+            finally:
+                await admin.close()
+
+
+async def _report(args, admin_dsn: str, dsn: str, name: str, work: Path,
+                  snapshot: Path, live_rows: int) -> int:
     import hive_data
     from hive_data import memory as pg_memory
 
@@ -214,6 +249,7 @@ async def main() -> int:
 
     embed = lucent_memory._embed
     lines: list[str] = []
+    ratios: list[tuple[str, float, float, float]] = []
     agreed = 0
     overlaps: list[float] = []
     worst_cosine = 0.0
@@ -236,10 +272,29 @@ async def main() -> int:
             lucent_memory._embed = lambda _text, _v=vector: _v
 
             import json
+            # Scoped the way the live caller scopes it. The contextual
+            # retrieval hook passes [its own mind, "shared"] on every turn,
+            # and an unscoped comparison exercises a different code path
+            # from the one the hive actually runs — including the keyword
+            # pool, whose provenance handling is the thing most likely to
+            # diverge.
             before = json.loads(lucent_memory.memory_retrieve_hybrid(
-                query, k=TOP_K, debug=True))
+                query, k=TOP_K, mind_ids=SCOPE, debug=True))
             after = await pg_memory.recall(
-                query=query, embedding=vector, k=TOP_K, debug=True)
+                query=query, embedding=vector, k=TOP_K, mind_ids=SCOPE,
+                debug=True)
+
+            # The ratio the keyword rescaling constant approximates, measured
+            # per query rather than fitted to one. Reported so the constant
+            # in `hive_data.memory` can be checked against this table.
+            old_bm = max((m["debug"]["bm25"]
+                          for m in before.get("memories", [])), default=0.0)
+            new_bm = max((m["debug"]["bm25"]
+                          for m in after["memories"]), default=0.0)
+            if old_bm > 0 and new_bm > 0:
+                ratios.append(
+                    (query, old_bm, new_bm / pg_memory.KEYWORD_SCALE,
+                     old_bm / (new_bm / pg_memory.KEYWORD_SCALE)))
 
             old_ids = [int(m["id"]) for m in before.get("memories", [])]
             new_ids = [int(m["id"]) for m in after["memories"]]
@@ -282,15 +337,6 @@ async def main() -> int:
     finally:
         lucent_memory._embed = embed
         await hive_data.close(drain_timeout=5.0)
-        if not args.keep:
-            admin = await asyncpg.connect(admin_dsn)
-            try:
-                await admin.execute(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = $1 AND pid <> pg_backend_pid()", name)
-                await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
-            finally:
-                await admin.close()
 
     mean_overlap = sum(overlaps) / len(overlaps) if overlaps else 0.0
     header = [
@@ -319,6 +365,31 @@ async def main() -> int:
         "Where the two answers differ, it is that half moving.",
         "",
     ]
+    scale_in_use = pg_memory.KEYWORD_SCALE
+    if ratios:
+        spread = sorted(r[3] for r in ratios)
+        median = spread[len(spread) // 2]
+        header += [
+            "## The keyword scale",
+            "",
+            "Postgres has no BM25. `ts_rank` is bounded below 1 and "
+            "`bm25()` is not bounded at all, so no single multiplier maps "
+            "one onto the other for every query — but the figure is added "
+            "to the combined score with a fixed coefficient and rendered "
+            "into every mind's context, so being within a factor of two of "
+            "the old magnitude matters. "
+            f"`hive_data.memory.KEYWORD_SCALE` is **{scale_in_use:.0f}**; "
+            f"measured here the ratio runs **{spread[0]:.0f} to "
+            f"{spread[-1]:.0f}**, median **{median:.0f}**.",
+            "",
+            "| query | FTS5 `bm25` | raw `ts_rank` | ratio |",
+            "|---|---|---|---|",
+        ]
+        for query, old_bm, raw, ratio in ratios:
+            header.append(
+                f"| `{query}` | {old_bm:.3f} | {raw:.5f} | {ratio:.0f} |")
+        header.append("")
+
     out = REPO / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(header + lines))

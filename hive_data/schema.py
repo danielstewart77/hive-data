@@ -108,12 +108,18 @@ PRIVATE: dict[str, frozenset[str]] = {
     #: another.
     "credentials": frozenset({"token_sha"}),
     "users": frozenset({"password_hash"}),
+    #: The 4096 floats. Private because no caller reading memories wants
+    #: them: lucent has never returned an embedding, and a listing that
+    #: included one hands back 4096 numbers per row, as a 50,000-character
+    #: literal over the wire, on a route called every turn. A caller that
+    #: genuinely needs the vector asks for it by name.
+    #:
     #: The searchable form of the text, not the text. It is a tsvector, it
     #: is the size of the content again, and asyncpg has no codec for it, so
     #: a listing that selected it would hand every caller a large string of
     #: lexeme positions nobody asked for. Declared so the drift check sees
     #: it; private so no read returns it.
-    "memories": frozenset({"content_search"}),
+    "memories": frozenset({"content_search", "embedding"}),
     "sessions": frozenset({
         "carry_forward", "carry_forward_sid", "carry_forward_at",
         "carry_forward_prompt_cap", "resend_content", "resend_images",
@@ -292,6 +298,16 @@ async def verify(connection: Any) -> None:
         and column in applied[(schema_of(table), table)]
         and applied[(schema_of(table), table)][column] != expected
     )
+    # Reported before the sequence probe below, and the order is the finding
+    # rather than a tidiness preference. `pg_get_serial_sequence` raises on a
+    # table or column that is not there, so a `memories` or `users` missing a
+    # declared column used to come back as the driver's own sentence about
+    # that one column - and anything else that had drifted went unmentioned.
+    # The operator fixed the column they were told about, restarted, and got
+    # the rest of the drift on the next boot.
+    if missing_tables or missing_columns or wrong_types:
+        _refuse(missing_tables, missing_columns, wrong_types)
+
     behind = await _sequences_behind(connection, present)
     if behind:
         raise SequenceBehind(
@@ -304,18 +320,24 @@ async def verify(connection: Any) -> None:
             "caller is told is benign, so a ledger would record nothing "
             "while reporting a harmless duplicate. Run setval on each.")
 
-    if missing_tables or missing_columns or wrong_types:
-        parts = []
-        if missing_tables:
-            parts.append("tables absent: " + ", ".join(missing_tables))
-        if missing_columns:
-            parts.append("columns absent: " + ", ".join(missing_columns))
-        if wrong_types:
-            parts.append("columns of the wrong type: "
-                         + "; ".join(wrong_types))
-        raise SchemaMismatch(
-            "the applied schema is not the one these operations were "
-            "written against — " + "; ".join(parts) + ". Refusing at "
-            "startup rather than at the call site: a column this package "
-            "names and the database does not have arrives as a missing dict "
-            "key, and a missing key reads as a value.")
+    return None
+
+
+def _refuse(missing_tables: list[str], missing_columns: list[str],
+            wrong_types: list[str]) -> None:
+    """Refuse to open, naming everything that has drifted at once."""
+    from .errors import SchemaMismatch
+
+    parts = []
+    if missing_tables:
+        parts.append("tables absent: " + ", ".join(missing_tables))
+    if missing_columns:
+        parts.append("columns absent: " + ", ".join(missing_columns))
+    if wrong_types:
+        parts.append("columns of the wrong type: " + "; ".join(wrong_types))
+    raise SchemaMismatch(
+        "the applied schema is not the one these operations were written "
+        "against — " + "; ".join(parts) + ". Refusing at startup rather "
+        "than at the call site: a column this package names and the "
+        "database does not have arrives as a missing dict key, and a "
+        "missing key reads as a value.")

@@ -44,7 +44,6 @@ SET row_security = off;
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA public;
 
-
 --
 -- Name: memory; Type: SCHEMA; Schema: -; Owner: -
 --
@@ -205,7 +204,11 @@ CREATE TABLE memory.memories (
     recurring bigint,
     codebase_ref text,
     created_at bigint,
-    content_search tsvector GENERATED ALWAYS AS (to_tsvector('memory.hive_text'::regconfig, "left"(content, 100000))) STORED
+    content_search tsvector GENERATED ALWAYS AS (to_tsvector('memory.hive_text'::regconfig,
+CASE
+    WHEN (length(content) > 100000) THEN regexp_replace("left"(content, 100000), '\S+$'::text, ''::text)
+    ELSE content
+END)) STORED
 );
 
 

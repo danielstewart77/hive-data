@@ -280,7 +280,8 @@ async def test_an_embedding_comes_back_as_numbers_rather_than_as_text(
     mind = f"mind-{uuid.uuid4().hex[:8]}"
     stored = await _store(mind, "a memory", direction(0.5), int(clock))
 
-    row = await memory.get(stored)
+    assert "embedding" not in await memory.get(stored)
+    row = await memory.get(stored, embedding=True)
 
     assert isinstance(row["embedding"], list)
     assert len(row["embedding"]) == DIMENSIONS
@@ -575,3 +576,270 @@ async def test_a_database_with_no_memory_schema_still_opens_for_everyone_else(
             await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
         finally:
             await admin.close()
+
+
+# --------------------------------------------------------------------------
+# What the mutation reviewer proved nothing was guarding
+# --------------------------------------------------------------------------
+
+
+async def test_the_index_keeps_the_filler_words_the_query_filter_removes(
+        connected, clock, inspector):
+    """The decision the whole text configuration argument turns on, and it was
+    unguarded: a stopword dictionary on the document side strips words FTS5
+    indexes, so a query word in Postgres's list but not in lucent's — `about`,
+    `same`, `than`, `such` — would match nothing where it matches today.
+    Asserted on the stored tsvector, because the query-side stoplist hides
+    this from every behavioural test."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    stored = await _store(mind, "a note about the thing", unit(), int(clock))
+
+    indexed = await inspector.fetchval(
+        'SELECT "content_search"::text FROM memory."memories" '
+        'WHERE "id" = $1', stored)
+
+    assert "'about'" in indexed
+    assert "'the'" in indexed
+
+
+async def test_a_query_word_outside_lucents_stoplist_still_finds_its_memory(
+        connected, clock):
+    """`about` is not in lucent's eighty-word list, so it reaches Postgres as
+    a search term and has to match. The same break seen from the caller's
+    side rather than the index's."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    wanted = await _store(mind, "a note about tendinopathy", unit(),
+                          int(clock))
+    await _store(mind, "a note concerning tendinopathy", unit(), int(clock))
+
+    found = await memory.keyword("about", mind_id=mind)
+
+    assert [int(r["id"]) for r in found] == [wanted]
+
+
+async def test_a_similarity_threshold_excludes_what_neither_half_found(
+        connected, clock):
+    """The other side of the threshold. The suite guarded the keyword bypass
+    and not the threshold itself, so removing the filter outright passed."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    now = float(clock)
+    close = await _store(mind, "a close memory", direction(0.9), int(now))
+    await _store(mind, "an unrelated memory", direction(0.1), int(now))
+
+    answer = await memory.recall(query="zzzznomatch", embedding=unit(),
+                                 mind_id=mind, min_score=0.5, now=now)
+
+    assert [int(r["id"]) for r in answer["memories"]] == [close]
+
+
+async def test_a_recall_given_a_threshold_of_nan_is_refused(connected):
+    """Every comparison with NaN is false, so the threshold would filter
+    nothing and the answer would look like one that had been filtered."""
+    with pytest.raises(hive_data.ValueRefused):
+        await memory.recall(query="anything", embedding=unit(),
+                            min_score=float("nan"))
+
+
+async def test_the_keyword_score_weighs_on_the_leftover_ranking(
+        connected, clock):
+    """The backfill adds a fraction of the keyword score to the combined one,
+    which is the only reason that score is rescaled at all — and it was
+    unguarded, so the term could be deleted outright.
+
+    The two rows under test tie exactly on similarity and on age, and the
+    keyword slot is already spoken for by a stronger match, so the only thing
+    that can order them is the backfill."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    now = float(clock)
+    for n in range(3):
+        await _store(mind, f"a filler memory {n}", direction(0.95 - n / 100),
+                     int(now))
+    await _store(mind, "another filler", direction(0.9), int(now))
+    await _store(mind, "tendinopathy bursitis elbow pain and swelling",
+                 direction(0.7), int(now))
+    plain = await _store(mind, "aaa bbb ccc ddd", direction(0.5), int(now))
+    worded = await _store(mind, "tendinopathy xxx yyy zzz", direction(0.5),
+                          int(now))
+
+    answer = await memory.recall(query="tendinopathy bursitis",
+                                 embedding=unit(), mind_id=mind, k=20,
+                                 now=now)
+    order = [int(r["id"]) for r in answer["memories"]]
+    buckets = {int(r["id"]): r["debug"]["bucket"] for r in answer["memories"]}
+
+    assert buckets[worded] == "fill"
+    assert buckets[plain] == "fill"
+    assert order.index(worded) < order.index(plain)
+
+
+async def test_punctuation_a_caller_typed_never_reaches_the_query_parser(
+        connected, clock):
+    """`to_tsquery` reads `&`, `|`, `!` and `<->` as syntax. It does not
+    raise on them — it silently reinterprets, so a typed `!` turns an OR
+    search into an AND-NOT and quietly drops matches."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    both = await _store(mind, "tendinopathy of the elbow", unit(),
+                        int(clock))
+    one = await _store(mind, "tendinopathy of the shoulder", unit(),
+                       int(clock))
+
+    assert memory.terms("rotation & !pane <-> x") == ["rotation", "pane"]
+    found = {int(r["id"])
+             for r in await memory.keyword("tendinopathy & !elbow",
+                                           mind_id=mind)}
+
+    assert found == {both, one}
+
+
+async def test_a_recall_naming_no_mind_at_all_reads_across_the_hive(
+        connected, clock):
+    """The console's own pages and the nightly pruner do this on purpose.
+    Every other scoping test names a mind, so turning the unrestricted read
+    into "match nothing" passed the whole suite."""
+    mind_a = f"mind-{uuid.uuid4().hex[:8]}"
+    mind_b = f"mind-{uuid.uuid4().hex[:8]}"
+    a = await _store(mind_a, "a's memory", unit(), int(clock))
+    b = await _store(mind_b, "b's memory", unit(), int(clock))
+
+    found = {int(r["id"]) for r in await memory.similar(unit())}
+
+    assert {a, b} <= found
+
+
+async def test_a_single_mind_name_passed_as_a_list_of_one_is_refused(
+        connected):
+    """A `str` is a `Sequence[str]`, so no type checker catches it and
+    iterating one gives its characters: the read scopes to minds called 's',
+    'k' and so on, returns nothing, and reads as "no memories about that"."""
+    with pytest.raises(hive_data.ValueRefused):
+        await memory.similar(unit(), mind_ids="skippy")
+
+
+async def test_a_memory_stored_without_a_vector_is_skipped_not_crashed_on(
+        connected, clock):
+    """`store` accepts no embedding — the loader writes rows before their
+    vectors exist. Without the guard, scoring one computes a float of None."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    real = await _store(mind, "a memory with a vector", unit(), int(clock))
+    await memory.store(mind_id=mind, content="a memory with none",
+                       created_at=int(clock))
+
+    assert [int(r["id"]) for r in await memory.similar(unit(), mind_id=mind)
+            ] == [real]
+
+
+async def test_a_memory_with_no_vector_never_takes_the_keyword_slot(
+        connected, clock):
+    """lucent builds its candidates in the vector pass and records keyword
+    scores only for rows already there, so it can never return one. Scoring
+    it zero reads as "measured and distant" where the truth is "never
+    measured", and takes the slot from a memory that was."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    now = float(clock)
+    for n in range(4):
+        await _store(mind, f"a close memory {n}", direction(0.9 - n / 100),
+                     int(now))
+    measured = await _store(mind, "tendinopathy measured", direction(0.0),
+                            int(now))
+    await memory.store(mind_id=mind, content="tendinopathy unmeasured",
+                       created_at=int(now))
+
+    answer = await memory.recall(query="tendinopathy", embedding=unit(),
+                                 mind_id=mind, now=now)
+    by_bucket = {r["debug"]["bucket"]: int(r["id"])
+                 for r in answer["memories"]}
+
+    assert by_bucket["bm25"] == measured
+
+
+async def test_a_keyword_hit_outside_the_vector_pool_is_scored_for_itself(
+        connected, clock):
+    """lucent has a cosine for every row because it scores the whole store;
+    here the vector pool stops at twenty, so a keyword hit past it is scored
+    on its own. Nothing had more than twenty rows, so the branch never ran."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    now = float(clock)
+    for n in range(25):
+        await _store(mind, f"a filler memory {n}", direction(0.9 - n / 1000),
+                     int(now))
+    far = await _store(mind, "tendinopathy of the elbow", direction(0.2),
+                       int(now))
+
+    answer = await memory.recall(query="tendinopathy", embedding=unit(),
+                                 mind_id=mind, now=now)
+    row = next(r for r in answer["memories"] if int(r["id"]) == far)
+
+    assert row["debug"]["cosine"] == pytest.approx(0.2, abs=1e-3)
+
+
+async def test_the_keyword_slot_goes_empty_rather_than_to_a_row_no_word_matched(
+        connected, clock):
+    """The bucket label is rendered into the model's context every turn, so a
+    row labelled `bm25` that matched no word is a claim about why it is
+    there."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    now = float(clock)
+    for n in range(5):
+        await _store(mind, f"a filler memory {n}", direction(0.9 - n / 100),
+                     int(now))
+
+    answer = await memory.recall(query="zzzznomatch", embedding=unit(),
+                                 mind_id=mind, now=now)
+    buckets = [r["debug"]["bucket"] for r in answer["memories"]]
+
+    assert "bm25" not in buckets
+
+
+async def test_a_recall_reports_the_raw_similarity_and_the_pool_it_chose_from(
+        connected, clock):
+    """`score` is the raw cosine, not the recency-weighted product, and
+    `pool_size` is how many candidates were considered. Both were asserted
+    to exist and never to be right."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    now = float(clock) - 365 * 86400
+    stored = await _store(mind, "an old memory", direction(0.8), int(now))
+
+    answer = await memory.recall(query="memory", embedding=unit(),
+                                 mind_id=mind, now=float(clock))
+    row = answer["memories"][0]
+
+    assert int(row["id"]) == stored
+    assert row["score"] == pytest.approx(0.8, abs=1e-3)
+    assert row["debug"]["recency_mult"] == pytest.approx(memory.RECENCY_FLOOR)
+    assert answer["pool_size"] == 1
+
+
+async def test_a_vector_of_the_wrong_width_is_refused(connected, clock):
+    """The column declares 4096. A bare `vector` would take a row of any
+    width and the mismatch would then arrive at query time, on every recall,
+    as an error about a row nobody can identify."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+
+    with pytest.raises(hive_data.ValueRefused):
+        await memory.store(mind_id=mind, content="too short",
+                           embedding=[1.0, 0.0, 0.0], created_at=int(clock))
+
+
+async def test_a_recall_row_carries_the_keys_lucents_callers_read_and_no_more(
+        connected, clock):
+    """lucent builds its rows by hand. A key it never returned is a key a
+    reader did not budget for — and the embedding is 4096 of them."""
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    await _store(mind, "a memory", unit(), int(clock))
+
+    answer = await memory.recall(query="memory", embedding=unit(),
+                                 mind_id=mind, now=float(clock))
+    row = answer["memories"][0]
+
+    assert set(row) == set(memory._RECALL_KEYS) | {"score", "debug"}
+    assert row["superseded"] is False
+
+
+async def test_a_memory_is_deleted_and_the_deletion_is_reported(
+        connected, clock):
+    mind = f"mind-{uuid.uuid4().hex[:8]}"
+    stored = await _store(mind, "a memory", unit(), int(clock))
+
+    assert (await memory.delete(stored))["rows"] == 1
+    assert await memory.get(stored) is None
+    assert (await memory.delete(stored))["rows"] == 0

@@ -1,14 +1,30 @@
 # Memory search parity: FTS5 against Postgres
 
-Generated 2026-10-26T20:52:29 by `tools/memory_search_parity.py`.
+Generated 2026-10-26T21:20:11 by `tools/memory_search_parity.py`.
 
-* corpus: **7895** memories, snapshotted from the live lucent store and loaded into a scratch Postgres database this script created and dropped
+* corpus: **7912** memories, snapshotted from the live lucent store and loaded into a scratch Postgres database this script created and dropped
 * queries: **10** real ones, each embedded once and handed to both engines, so any difference below is a difference in the search
 * identical top-5 **in the same order**: **3/10**
 * mean overlap in the top 5: **86%**
 * largest disagreement on a shared row's cosine: **1.00e-04**
 
 Cosine is the half that can be expected to agree exactly, and the figure above says it does to well inside the four decimal places the response rounds to. The keyword half cannot agree exactly: Postgres has no BM25, so `ts_rank` is a different formula rescaled into the range the surrounding arithmetic was written against. Where the two answers differ, it is that half moving.
+
+## The keyword scale
+
+Postgres has no BM25. `ts_rank` is bounded below 1 and `bm25()` is not bounded at all, so no single multiplier maps one onto the other for every query — but the figure is added to the combined score with a fixed coefficient and rendered into every mind's context, so being within a factor of two of the old magnitude matters. `hive_data.memory.KEYWORD_SCALE` is **264**; measured here the ratio runs **93 to 538**, median **264**.
+
+| query | FTS5 `bm25` | raw `ts_rank` | ratio |
+|---|---|---|---|
+| `rotation threshold for a terminal pane` | 17.988 | 0.08304 | 217 |
+| `which voice engine speaks a mind` | 16.806 | 0.06904 | 243 |
+| `postgres migration one database` | 19.011 | 0.06459 | 294 |
+| `surface claim who a bot answers` | 17.349 | 0.06024 | 288 |
+| `left elbow tendinopathy reloading` | 19.815 | 0.03683 | 538 |
+| `restart the comms container` | 11.635 | 0.08275 | 141 |
+| `what did Daniel decide about Zeek output` | 15.001 | 0.05682 | 264 |
+| `lunch with Jose` | 14.195 | 0.03800 | 374 |
+| `rotating a session` | 8.806 | 0.09418 | 93 |
 
 ### `rotation threshold for a terminal pane`
 
@@ -41,8 +57,8 @@ Cosine is the half that can be expected to agree exactly, and the figure above s
 | rank | lucent (FTS5) | bucket | Postgres | bucket | cosine agrees |
 |---|---|---|---|---|---|
 | 1 | 8136 | recency | 8136 | recency | yes |
-| 2 | 8047 | recency | 8047 | recency | yes |
-| 3 | 8212 | recency | 8212 | recency | yes |
+| 2 | 8321 | recency | 8321 | recency | yes |
+| 3 | 8047 | recency | 8047 | recency | yes |
 | 4 | 8011 | cosine | 8011 | cosine | yes |
 | 5 | 8010 | bm25 | 575 | bm25 |  |
 
@@ -54,7 +70,7 @@ Cosine is the half that can be expected to agree exactly, and the figure above s
 |---|---|---|---|---|---|
 | 1 | 8164 | recency | 8164 | recency | yes |
 | 2 | 8064 | recency | 8064 | recency | yes |
-| 3 | 7954 | recency | 7954 | recency | yes |
+| 3 | 8166 | recency | 8166 | recency | yes |
 | 4 | 5017 | cosine | 5017 | cosine | yes |
 | 5 | 7951 | bm25 | 7951 | bm25 | yes |
 
@@ -101,10 +117,10 @@ Cosine is the half that can be expected to agree exactly, and the figure above s
 | rank | lucent (FTS5) | bucket | Postgres | bucket | cosine agrees |
 |---|---|---|---|---|---|
 | 1 | 8064 | recency | 8064 | recency | yes |
-| 2 | 7722 | recency | 7722 | recency | yes |
-| 3 | 7677 | recency | 7677 | recency | yes |
-| 4 | 2682 | cosine | 2682 | cosine | yes |
-| 5 | 7666 | fill | 7666 | fill | yes |
+| 2 | 8177 | recency | 8177 | recency | yes |
+| 3 | 7747 | recency | 7747 | recency | yes |
+| 4 | 2146 | cosine | 2146 | cosine | yes |
+| 5 | 7180 | fill | 7180 | fill | yes |
 
 ### `lunch with Jose`
 
@@ -113,10 +129,10 @@ Cosine is the half that can be expected to agree exactly, and the figure above s
 | rank | lucent (FTS5) | bucket | Postgres | bucket | cosine agrees |
 |---|---|---|---|---|---|
 | 1 | 8064 | recency | 8064 | recency | yes |
-| 2 | 7677 | recency | 7677 | recency | yes |
-| 3 | 7425 | recency | 7425 | recency | yes |
-| 4 | 2682 | cosine | 2682 | cosine | yes |
-| 5 | 3047 | bm25 | 3047 | bm25 | yes |
+| 2 | 7747 | recency | 7747 | recency | yes |
+| 3 | 7180 | recency | 7180 | recency | yes |
+| 4 | 3047 | cosine | 3047 | cosine | yes |
+| 5 | 3048 | bm25 | 3048 | bm25 | yes |
 
 ### `rotating a session`
 
