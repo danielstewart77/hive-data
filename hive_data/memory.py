@@ -384,7 +384,7 @@ async def recall(*, query: str, embedding: Sequence[float],
     if not scored:
         return {"memories": [], "count": 0, "mode": "hybrid", "pool_size": 0}
 
-    rec_slots = max(0, min(3, k - 2)) if k >= 5 else min(k, 3)
+    rec_slots = k
     cos_slots = 1 if k >= 4 else 0
     bm_slots = 1 if k >= 5 else 0
     rec_slots = min(rec_slots, k)

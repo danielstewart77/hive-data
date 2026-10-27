@@ -181,7 +181,11 @@ async def main() -> int:
     live_rows = _snapshot(snapshot)
     print(f"snapshot: {live_rows} memories", file=sys.stderr)
 
-    name = f"hive_data_test_parity_{uuid.uuid4().hex[:8]}"
+    # Deliberately NOT `hive_data_test_*`: the suite's own fixture sweeps
+    # every database matching that prefix at session start, to clean up after
+    # interrupted runs. A report database named inside that namespace gets
+    # dropped out from under this script the moment anybody runs the tests.
+    name = f"memory_parity_{uuid.uuid4().hex[:8]}"
     admin = await asyncpg.connect(admin_dsn)
     try:
         await admin.execute(f'CREATE DATABASE "{name}"')
@@ -208,14 +212,25 @@ async def main() -> int:
     os.environ[hive_data.config.DSN_VAR] = dsn
     await hive_data.connect()
 
+    embed = lucent_memory._embed
     lines: list[str] = []
     agreed = 0
     overlaps: list[float] = []
     worst_cosine = 0.0
     try:
         for query in QUERIES:
-            vector = lucent_memory._embed(query)
-            # The same vector on both sides. Patched rather than trusted to
+            # The real one, held aside before anything is patched. Taking
+            # it from the module each time round the loop is how the first
+            # version of this script embedded query one and then handed that
+            # same vector to all ten: the stub installed below *is*
+            # `_embed` by the second iteration, so the line that looked like
+            # it was asking the model was asking the stub. Every query after
+            # the first searched for the first one, which made four hub-like
+            # rows top every list and looked exactly like a finding about
+            # the corpus.
+            vector = embed(query)
+            # The same vector on both sides, so a difference in the answers
+            # is a difference in the search. Patched rather than trusted to
             # be deterministic: the model is served over HTTP and a second
             # call is a second inference.
             lucent_memory._embed = lambda _text, _v=vector: _v
@@ -265,6 +280,7 @@ async def main() -> int:
                     f"{n if n is not None else ''} | {nb} | {same} |")
             lines.append("")
     finally:
+        lucent_memory._embed = embed
         await hive_data.close(drain_timeout=5.0)
         if not args.keep:
             admin = await asyncpg.connect(admin_dsn)
