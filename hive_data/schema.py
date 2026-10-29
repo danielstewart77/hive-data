@@ -143,6 +143,13 @@ PRIVATE: dict[str, frozenset[str]] = {
     #: bearer digest a caller authenticates with, and a password hash.
     "tools.api_tokens": frozenset({"token_hash"}),
     "tools.users": frozenset({"password_hash"}),
+    #: What a gated call was actually called with. The approvals queue is a
+    #: listing, and these two are the captured request body of every tool
+    #: call a person was asked to approve — on live data the newest fifty
+    #: rows carry three megabytes of it, some of it holding credentials. The
+    #: page this listing is modelled on selects neither. The replay path,
+    #: which genuinely needs the body, names it.
+    "tools.hitl_requests": frozenset({"params_json", "tool_body"}),
     #: The 4096 floats. Private because no caller reading memories wants
     #: them: lucent has never returned an embedding, and a listing that
     #: included one hands back 4096 numbers per row, as a 50,000-character
@@ -251,7 +258,7 @@ async def _present_schemas(connection: Any) -> set[str]:
 
 
 async def _sequences_behind(connection: Any,
-                            present: set[str]) -> list[str]:
+                            declared: set[str]) -> list[str]:
     """Identity sequences whose next value a row already occupies.
 
     Checked at startup for the same reason the column names are: the failure
@@ -260,7 +267,11 @@ async def _sequences_behind(connection: Any,
     """
     out: list[str] = []
     for table, generated in GENERATED.items():
-        if schema_of(table) not in present:
+        # `declared` is the tables this database actually has, so a context
+        # it does not run — or one whose schema exists with no tables in it
+        # — is skipped. `pg_get_serial_sequence` raises on a table that is
+        # not there, which would make the probe the failure.
+        if table not in declared:
             continue
         for column in sorted(generated):
             where = schema_of(table)
@@ -327,6 +338,19 @@ async def verify(connection: Any) -> None:
             (row["table_schema"], row["table_name"]), {}
         )[row["column_name"]] = row["udt_name"]
 
+    # A schema that exists and holds none of its declared tables is a
+    # context nobody created — `CREATE SCHEMA` on its own is not one — and
+    # not drift. The distinction is load-bearing: every service in the hive
+    # shares this database, so a half-run migration that made the schema and
+    # no tables would otherwise stop comms, lucent and every mind from
+    # opening a pool over a context none of them use. A schema holding
+    # *some* of its tables is drift, and still refuses.
+    empty = {
+        schema for schema in present
+        if not any(key(table) in applied
+                   for table in declared if schema_of(table) == schema)
+    } - {REQUIRED_SCHEMA}
+    declared = {t for t in declared if schema_of(t) not in empty}
     missing_tables = sorted(
         qualified_name(table)
         for table in declared
@@ -357,7 +381,7 @@ async def verify(connection: Any) -> None:
     if missing_tables or missing_columns or wrong_types:
         _refuse(missing_tables, missing_columns, wrong_types)
 
-    behind = await _sequences_behind(connection, present)
+    behind = await _sequences_behind(connection, declared)
     if behind:
         raise SequenceBehind(
             "identity sequences are behind the rows already in their "
