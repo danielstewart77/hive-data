@@ -376,3 +376,44 @@ async def test_a_soul_write_records_the_moment_the_caller_stamped_it(
         "SELECT as_of FROM memory.nodes WHERE id = $1", node["id"])
     assert change["at"] == "2026-11-07T15:00:00+00:00"
     assert node_row["as_of"] == "2026-11-07T15:00:00+00:00"
+
+
+# Struck, and the reason kept: a test that two people each holding a Mind
+# node of one name resolve to a stable row could not be made to fail. The
+# table is unique on (owner, type, name), so the planner serves the lookup
+# from that index and returns index order whether or not the statement asks
+# for one — even after rewriting the lower-id tuple to put the physical order
+# at odds with the id order. The `ORDER BY "id"` stays in `node_find`: it
+# makes the answer defined rather than left to the planner, and an identity
+# guard resolving to a different row than the write after it is the fork the
+# guard exists to prevent. But no edit to the new code holds it accountable,
+# so it does not get written.
+
+
+async def test_a_merge_and_the_columns_beside_it_land_or_neither_does(
+        connected, inspector, owner, a_name, a_type):
+    """A column write after the merge is a second transaction.
+
+    Which means the blob merge commits, the column write is refused, and
+    the caller is handed a refusal for a merge that has already landed. The
+    columns are part of the merge's own statement, so a refusal on either
+    takes both back.
+
+    `first_name` is given a value Postgres cannot hold — a NUL byte, which
+    `text` has no encoding for — so the refusal comes from the database
+    rather than from a stub.
+    """
+    node = await graph.node_write(
+        owner=owner, type=a_type, name=a_name, mind_id="",
+        properties={"base": True})
+
+    with pytest.raises(hive_data.HiveDataError):
+        await graph.properties_merge(
+            node_id=node["id"], additions={"added": True},
+            columns={"first_name": "bad\x00name"})
+
+    row = await inspector.fetchrow(
+        "SELECT properties, first_name FROM memory.nodes WHERE id = $1",
+        node["id"])
+    assert json.loads(row["properties"]) == {"base": True}
+    assert row["first_name"] is None

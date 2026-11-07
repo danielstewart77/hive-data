@@ -201,6 +201,13 @@ async def node_find(*, type: str, name: str, owner: Any = UNSET,
     for its credential to be minted. Passed, including passed as `None`, it
     is one owner — and `IS NOT DISTINCT FROM` rather than `=` because a NULL
     owner is a real case here and `= NULL` matches nothing.
+
+    `ORDER BY "id"` is not decoration. The table is unique on *(owner, type,
+    name)*, so two people may each hold a Mind node called Skippy, and an
+    unordered `LIMIT 1` picks between them by whatever the planner felt
+    like — which means an identity guard and the write that follows it can
+    resolve to different rows, and the check then passes on one node while
+    the write lands on another.
     """
     sql = (f'SELECT {_NODE_READ} FROM {qualified("memory.nodes")} '
            'WHERE "type" = $1 AND "name" = $2')
@@ -208,7 +215,7 @@ async def node_find(*, type: str, name: str, owner: Any = UNSET,
     if owner is not UNSET:
         sql += ' AND "owner" IS NOT DISTINCT FROM $3'
         args.append(owner)
-    return await _fetch_one(unit, sql + " LIMIT 1", *args)
+    return await _fetch_one(unit, sql + ' ORDER BY "id" LIMIT 1', *args)
 
 
 async def nodes_for_owners(*, owners: Sequence[str] | None,
@@ -265,7 +272,9 @@ async def node_delete(node_id: int, *,
 
 
 async def properties_merge(*, node_id: int,
-                           additions: Mapping[str, Any]) -> dict[str, Any]:
+                           additions: Mapping[str, Any],
+                           columns: Mapping[str, Any] | None = None
+                           ) -> dict[str, Any]:
     """Add keys to a node's properties without dropping the ones there.
 
     Additive is the contract, and additive has to mean additive with respect
@@ -276,6 +285,12 @@ async def properties_merge(*, node_id: int,
     `SELECT ... FOR UPDATE` rather than a hold on the triple: the node is
     already identified, and locking the row serializes only the writers of
     that node. Nobody waits on an unrelated mind's write.
+
+    `columns` are the node's own columns the same call sets — `updated_at`,
+    `as_of`, `first_name` and the rest. They are a parameter rather than a
+    second call the caller makes afterwards, because a second call is a
+    second transaction: the blob merge commits, the column write is refused,
+    and the caller is handed a refusal for a merge that already landed.
     """
     async with transaction() as unit:
         row = await unit.fetch_one(
@@ -289,16 +304,24 @@ async def properties_merge(*, node_id: int,
                 "would hide that.")
         merged = _decoded(row["properties"])
         merged.update(dict(additions))
-        written = await unit.execute_returning(
-            f'UPDATE {qualified("memory.nodes")} SET "properties" = $1 '
-            'WHERE "id" = $2 RETURNING ' + _NODE_READ,
-            _blob(merged), node_id)
+        values = _sql.passed({"properties": _blob(merged),
+                              **dict(columns or {})})
+        sql, args = _sql.update("memory.nodes", values, {"id": node_id},
+                                returning=_NODE_COLUMNS)
+        written = await unit.execute_returning(sql, *args)
         return dict(written["row"])
 
 
 async def properties_remove(*, node_id: int,
-                            keys: Sequence[str]) -> dict[str, Any]:
-    """Drop named keys from a node's properties, under the same lock."""
+                            keys: Sequence[str],
+                            columns: Mapping[str, Any] | None = None
+                            ) -> dict[str, Any]:
+    """Drop named keys from a node's properties, under the same lock.
+
+    `columns` are cleared in the same statement for the same reason the
+    merge takes them: a caller that reported a column key as removed and
+    then failed to clear it has reported something that is still there.
+    """
     async with transaction() as unit:
         row = await unit.fetch_one(
             f'SELECT "properties" FROM {qualified("memory.nodes")} '
@@ -310,11 +333,13 @@ async def properties_remove(*, node_id: int,
         removed = [k for k in keys if k in remaining]
         for key in removed:
             remaining.pop(key, None)
-        written = await unit.execute_returning(
-            f'UPDATE {qualified("memory.nodes")} SET "properties" = $1 '
-            'WHERE "id" = $2 RETURNING ' + _NODE_READ,
-            _blob(remaining), node_id)
-        return {"row": dict(written["row"]), "removed": removed}
+        values = _sql.passed({"properties": _blob(remaining),
+                              **dict(columns or {})})
+        sql, args = _sql.update("memory.nodes", values, {"id": node_id},
+                                returning=_NODE_COLUMNS)
+        written = await unit.execute_returning(sql, *args)
+        return {"row": dict(written["row"]),
+                "removed": removed + sorted(dict(columns or {}))}
 
 
 async def edge_write(*, mind_id: str, source_id: int, target_id: int,
