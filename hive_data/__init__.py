@@ -50,6 +50,7 @@ from .errors import (
     ValueRefused,
     WriteRejected,
 )
+from . import graph
 from . import memory
 from . import tools
 from .pool import close_pool, live_pool, open_pool, run, settings_in_use
@@ -66,7 +67,7 @@ __all__ = [
     "Unit", "Unreachable", "UnsettableColumn", "ValueRefused",
     "WriteRejected", "board", "close", "connect", "conversation_lock",
     "core",
-    "from_environment",
+    "from_environment", "graph",
     "live_pool", "memory", "run", "settings_in_use", "tools",
     "transaction",
     "verify_schema",
