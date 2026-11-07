@@ -405,8 +405,22 @@ async def soul_change_record(*, node_id: int, mind_name: str,
 async def soul_replace(*, node_id: int, properties: Mapping[str, Any],
                        record_against: int | None = None,
                        mind_name: str, mind_id: Any, actor: Any,
-                       reason: Any, before: Any, after: Any) -> dict[str, Any]:
+                       reason: Any, before: Any, after: Any,
+                       at: Any = UNSET,
+                       as_of: Any = UNSET,
+                       updated_at: Any = UNSET) -> dict[str, Any]:
     """Replace a soul and record what it was, or do neither.
+
+    `at` is the moment the caller stamped the change with, and it reaches
+    `soul_changes.at`. Defaulted here it would be this write's own clock,
+    which is a different thing: the route reports back the stamp it was
+    given, and a record carrying a stamp nobody sent is a small lie in the
+    one table that exists to say what happened and when.
+
+    `as_of` and `updated_at` move on the node in the *same statement* as the
+    properties. The SQLite original set all three together, and splitting
+    them into a second call to keep this signature smaller would reintroduce
+    exactly the non-atomicity this function exists to prevent.
 
     `record_against` exists for the test that proves the pair is atomic: the
     provenance row is written against that id rather than the node's own, so
@@ -414,14 +428,18 @@ async def soul_replace(*, node_id: int, properties: Mapping[str, Any],
     has to roll back with it. In every real call it is left unset.
     """
     against = node_id if record_against is None else record_against
+    node_values = _sql.passed({
+        "properties": _blob(properties),
+        "as_of": as_of,
+        "updated_at": updated_at,
+    })
+    sql, args = _sql.update("memory.nodes", node_values, {"id": node_id})
     async with transaction() as unit:
-        await unit.execute(
-            f'UPDATE {qualified("memory.nodes")} SET "properties" = $1 '
-            'WHERE "id" = $2', _blob(properties), node_id)
+        await unit.execute(sql, *args)
         await soul_change_record(
             node_id=against, mind_name=mind_name, mind_id=mind_id,
             actor=actor, reason=reason, before=before, after=after,
-            unit=unit)
+            at=at, unit=unit)
         return {"rows": 1, "node_id": node_id}
 
 

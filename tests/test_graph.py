@@ -351,3 +351,28 @@ async def test_the_ownership_pass_refuses_a_table_it_does_not_declare(
     with pytest.raises(hive_data.ValueRefused):
         await graph.claim_owner(
             table="core.minds", row_id=1, owner="daniel")
+
+
+async def test_a_soul_write_records_the_moment_the_caller_stamped_it(
+        connected, inspector, owner, a_name, a_type):
+    """The record exists to say what happened and when.
+
+    Defaulting `at` to this write's own clock while the route reports back
+    the stamp it was handed makes the one table that answers "when" disagree
+    with the answer the caller was given.
+    """
+    node = await graph.node_write(
+        owner=owner, type=a_type, name=a_name, mind_id="", properties={})
+
+    await graph.soul_replace(
+        node_id=node["id"], properties={"soul_values": ["a"]},
+        mind_name=a_name, mind_id=None, actor="daniel", reason="stamped",
+        before={}, after={"soul_values": ["a"]},
+        at="2026-11-07T15:00:00+00:00", as_of="2026-11-07T15:00:00+00:00")
+
+    change = await inspector.fetchrow(
+        "SELECT at FROM memory.soul_changes WHERE node_id = $1", node["id"])
+    node_row = await inspector.fetchrow(
+        "SELECT as_of FROM memory.nodes WHERE id = $1", node["id"])
+    assert change["at"] == "2026-11-07T15:00:00+00:00"
+    assert node_row["as_of"] == "2026-11-07T15:00:00+00:00"
