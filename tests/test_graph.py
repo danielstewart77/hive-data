@@ -309,3 +309,45 @@ async def test_the_pruner_reads_the_rows_it_then_deletes(
     remaining = await inspector.fetch(
         "SELECT id FROM memory.memories WHERE data_class = $1", data_class)
     assert [r["id"] for r in remaining] == [kept["row"]["id"]]
+
+
+async def test_the_ownership_pass_claims_only_rows_that_have_no_owner(
+        connected, inspector, owner, a_name, a_type):
+    """The `WHERE owner IS NULL` is the arbitration, not a filter.
+
+    Two passes running at once — two containers starting together — are two
+    writers deciding one row, and the loser must not overwrite the claim the
+    winner already made. A mind whose credential is minted after a boot is
+    picked up at the next one, which is why the pass runs every time and has
+    to be safe to run twice.
+    """
+    ownerless = await graph.node_write(
+        owner=None, type=a_type, name=a_name, mind_id="writer-one",
+        properties={})
+    held = await graph.node_write(
+        owner=owner, type=a_type, name=f"{a_name}-held", mind_id="writer-one",
+        properties={})
+
+    pending = await graph.unowned_rows()
+    assert ownerless["id"] in [r["id"] for r in pending
+                               if r["table"] == "memory.nodes"]
+    assert held["id"] not in [r["id"] for r in pending]
+
+    first = await graph.claim_owner(
+        table="memory.nodes", row_id=ownerless["id"], owner="daniel")
+    second = await graph.claim_owner(
+        table="memory.nodes", row_id=ownerless["id"], owner="somebody-else")
+
+    assert first["rows"] == 1
+    assert second["rows"] == 0
+    row = await inspector.fetchrow(
+        "SELECT owner FROM memory.nodes WHERE id = $1", ownerless["id"])
+    assert row["owner"] == "daniel"
+
+
+async def test_the_ownership_pass_refuses_a_table_it_does_not_declare(
+        connected):
+    """The table name reaches a statement, so it is checked, not interpolated."""
+    with pytest.raises(hive_data.ValueRefused):
+        await graph.claim_owner(
+            table="core.minds", row_id=1, owner="daniel")

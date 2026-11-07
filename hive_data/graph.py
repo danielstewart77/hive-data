@@ -42,7 +42,7 @@ from typing import Any, Mapping, Sequence
 
 from . import _sql
 from .core import _execute, _execute_returning, _fetch, _fetch_one
-from .errors import MissingReference
+from .errors import MissingReference, ValueRefused
 from .rows import UNSET, as_row, as_rows
 from .schema import public as schema_public
 from .schema import qualified, select_list
@@ -623,3 +623,85 @@ async def memories_for_class(*, data_class: str,
     if not include_standing:
         sql += ' AND "tier" IS DISTINCT FROM \'standing\''
     return await _fetch(unit, sql + ' ORDER BY "id"', *args)
+
+
+#: The two graph tables that carry an owner, and whether they carry a type.
+#:
+#: `edges` has no `type` column in the sense the ownership pass means — its
+#: `type` is the relationship, not the entity kind — so the pass must not
+#: read one off it and conclude the row is a Mind.
+_OWNED_TABLES = (("memory.nodes", True), ("memory.edges", False))
+
+
+async def unowned_rows(*, limit: int = 5000,
+                       unit: Unit | None = None) -> list[dict[str, Any]]:
+    """Every graph row with no owner, with the writer that can resolve one.
+
+    The ownership pass is self-healing by design: a mind whose credential
+    was minted after the last boot is picked up at the next one. So this is
+    a read that runs at every start and is expected to be empty almost
+    always, and it names its table in each row so the caller can claim it
+    without a second lookup.
+    """
+    out: list[dict[str, Any]] = []
+    for table, has_type in _OWNED_TABLES:
+        type_column = '"type"' if has_type else "NULL"
+        rows = await _fetch(
+            unit, f'SELECT "id", "mind_id", {type_column} AS "type" '
+            f'FROM {qualified(table)} WHERE "owner" IS NULL '
+            f'ORDER BY "id" LIMIT $1', limit)
+        for row in rows:
+            out.append({**row, "table": table})
+    return out
+
+
+async def claim_owner(*, table: str, row_id: int, owner: str,
+                      unit: Unit | None = None) -> dict[str, Any]:
+    """Give one ownerless row an owner.
+
+    Only ownerless rows: the `WHERE owner IS NULL` is the arbitration. Two
+    passes running at once — two containers starting together — would
+    otherwise be two writers deciding the same row, and the second would
+    overwrite a claim the first had already made.
+    """
+    if table not in dict(_OWNED_TABLES):
+        raise ValueRefused(
+            f"{table!r} is not a table the ownership pass may write. The "
+            f"name reaches a statement, so it is checked against the "
+            f"declared set rather than interpolated: "
+            f"{', '.join(t for t, _ in _OWNED_TABLES)}.")
+    return await _execute(
+        unit, f'UPDATE {qualified(table)} SET "owner" = $1 '
+        'WHERE "id" = $2 AND "owner" IS NULL', owner, row_id)
+
+
+async def credentials_live(*, unit: Unit | None = None) -> list[dict[str, Any]]:
+    """Every credential that has not been revoked.
+
+    A read of all of them rather than a lookup by digest, because the caller
+    compares in constant time over the set: an indexed equality on
+    `token_sha` would decide recognition inside the database, where the
+    comparison cannot be made constant-time and where two holders sharing
+    one value would resolve to whichever row the planner reached first —
+    which is one holder authenticating as another.
+    """
+    return await _fetch(
+        unit, f'SELECT {select_list("memory.credentials")} '
+        f'FROM {qualified("memory.credentials")} '
+        'WHERE "revoked_at" IS NULL ORDER BY "holder"')
+
+
+async def credential_holder_of_digest(*, token_sha: str, other_than: str,
+                                      unit: Unit | None = None
+                                      ) -> str | None:
+    """Which other holder already has this digest, if any.
+
+    The clash check, kept as its own operation because its refusal names the
+    holder: "that value is already held by X; a credential belongs to one
+    holder" is the sentence an operator needs, and a unique-constraint
+    violation is not it.
+    """
+    row = await _fetch_one(
+        unit, f'SELECT "holder" FROM {qualified("memory.credentials")} '
+        'WHERE "token_sha" = $1 AND "holder" <> $2', token_sha, other_than)
+    return None if row is None else str(row["holder"])

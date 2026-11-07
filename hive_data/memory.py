@@ -307,6 +307,8 @@ async def delete(memory_id: int, *, unit: Unit | None = None) -> dict[str, int]:
 async def similar(embedding: Sequence[float], *, limit: int = VECTOR_POOL,
                   mind_id: str | None = None,
                   mind_ids: Sequence[str] | None = None,
+                  data_class: str | None = None,
+                  tag: str | None = None,
                   unit: Unit | None = None) -> list[dict[str, Any]]:
     """The memories nearest a vector, nearest first, with their similarity.
 
@@ -318,12 +320,34 @@ async def similar(embedding: Sequence[float], *, limit: int = VECTOR_POOL,
     and these embeddings are 4096, so there is no index to build; measured
     over the live corpus the scan costs 190ms warm, against a statement
     deadline of 30 seconds.
+
+    `data_class` and `tag` narrow the scan before the ranking, and they are
+    parameters rather than something a caller filters afterwards because
+    save-time dedup depends on the difference. Dedup asks for the nearest
+    row *in one class* and refuses a write at a cosine of 0.92: ask for the
+    global nearest and filter after, and an unrelated row from another
+    class answers "already stored" and the turn's memory is never written
+    while the hook records success. Widen the limit to compensate instead
+    and the true in-class neighbour falls outside the window, so dedup stops
+    firing and duplicates accumulate one per turn. Neither failure says
+    anything out loud.
+
+    The tag match is `LOWER` on both sides. `LIKE` is case-insensitive in
+    SQLite and case-sensitive here, and a tag filter that quietly stops
+    matching answers "no memories matched", which is a sentence a model will
+    say out loud.
     """
     values = _checked_query_vector(embedding)
     clause, args = _provenance(mind_id, mind_ids, 2)
     conditions = ['"embedding" IS NOT NULL']
     if clause:
         conditions.append(clause)
+    if data_class is not None:
+        args.append(data_class)
+        conditions.append(f'"data_class" = ${len(args) + 1}')
+    if tag is not None:
+        args.append(f"%{str(tag).lower()}%")
+        conditions.append(f'LOWER("tags") LIKE ${len(args) + 1}')
     sql = (f'SELECT {_READ}, 1 - ("embedding" <=> $1) AS "score" '
            f'FROM {qualified("memories")} '
            f'WHERE {" AND ".join(conditions)} '
