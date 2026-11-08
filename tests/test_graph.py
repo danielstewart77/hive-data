@@ -417,3 +417,83 @@ async def test_a_merge_and_the_columns_beside_it_land_or_neither_does(
         node["id"])
     assert json.loads(row["properties"]) == {"base": True}
     assert row["first_name"] is None
+
+
+async def test_a_merge_refuses_a_blob_it_cannot_read_rather_than_overwriting_it(
+        connected, inspector, owner, a_name, a_type):
+    """A read-modify-write cannot modify what it could not read.
+
+    The decoder used to answer an empty dict for a blob that would not
+    parse, and the merge then wrote that empty dict plus its own additions
+    back over the row — every other key on the node destroyed as a side
+    effect of adding one, and the caller told the merge landed.
+
+    The unreadable blob is put there with the `inspector`, a driver
+    connection outside the package, because no operation in the package
+    will write one.
+    """
+    node = await graph.node_write(
+        owner=owner, type=a_type, name=a_name, mind_id="",
+        properties={"keep": "this"})
+    await inspector.execute(
+        "UPDATE memory.nodes SET properties = $1 WHERE id = $2",
+        "{not json at all", node["id"])
+
+    with pytest.raises(hive_data.ValueRefused):
+        await graph.properties_merge(
+            node_id=node["id"], additions={"added": True})
+
+    row = await inspector.fetchrow(
+        "SELECT properties FROM memory.nodes WHERE id = $1", node["id"])
+    assert row["properties"] == "{not json at all"
+
+
+async def test_two_soul_writes_from_one_read_do_not_overwrite_each_other(
+        connected, inspector, owner, a_name, a_type):
+    """The compare-and-set has to be inside the unit that writes.
+
+    Both writers read the same change count — zero — and both find it
+    matching. Read and checked outside the transaction, with nothing held
+    between the check and the write, both then write and the second lands
+    on top of the first with both told their line landed. That is the one
+    loss the soul's provenance table exists to make impossible.
+
+    What this holds accountable is the check living inside the unit that
+    writes: moved back out, or neutered, this test dies. The `FOR UPDATE` on
+    the node row beside it is not separately falsifiable here — removing it
+    leaves the test passing, because these two transactions serialize on the
+    pool anyway. It stays because the serialization it provides is the one
+    that still holds when they do not.
+    """
+    node = await graph.node_write(
+        owner=owner, type=a_type, name=a_name, mind_id="",
+        properties={"soul_values": []})
+
+    async def write(line: str):
+        try:
+            return await graph.soul_replace(
+                node_id=node["id"], properties={"soul_values": [line]},
+                mind_name=a_name, mind_id=None, actor="daniel",
+                reason=line, before=[], after=[line],
+                expected_change_count=0)
+        except hive_data.StaleRead as moved:
+            return moved
+
+    first, second = await asyncio.gather(write("alice"), write("bob"))
+
+    landed = [r for r in (first, second) if isinstance(r, dict)]
+    refused = [r for r in (first, second)
+               if isinstance(r, hive_data.StaleRead)]
+    assert len(landed) == 1, (first, second)
+    assert len(refused) == 1
+    assert refused[0].observed == 1
+
+    row = await inspector.fetchrow(
+        "SELECT properties FROM memory.nodes WHERE id = $1", node["id"])
+    changes = await inspector.fetch(
+        "SELECT reason FROM memory.soul_changes WHERE node_id = $1",
+        node["id"])
+    # One change recorded, and the soul says what that one change said.
+    assert len(changes) == 1
+    assert json.loads(row["properties"])["soul_values"] == [
+        changes[0]["reason"]]

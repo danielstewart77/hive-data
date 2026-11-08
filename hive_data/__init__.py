@@ -32,6 +32,7 @@ from . import core
 from .config import Settings, from_environment
 from .errors import (
     Conflict,
+    StaleRead,
     CredentialRefused,
     DatabaseMissing,
     HiveDataError,
@@ -59,7 +60,7 @@ from .schema import COLUMNS
 from .unit import Unit, conversation_lock, transaction
 
 __all__ = [
-    "COLUMNS", "Conflict", "CredentialRefused", "DatabaseMissing",
+    "COLUMNS", "Conflict", "StaleRead", "CredentialRefused", "DatabaseMissing",
     "HiveDataError", "IdentityNotWritable", "MissingReference",
     "NoConnectionAvailable", "NotConfigured", "NotInitialised",
     "SchemaMismatch", "SequenceBehind", "Settings", "TimedOut",

@@ -460,6 +460,7 @@ async def recall(*, query: str, embedding: Sequence[float],
     # without it, the port answers with an error where the thing it
     # replaces answers with results. Not swallowed silently — it is logged,
     # and it never hides a failure of the vector half, which is above.
+    mode = "hybrid"
     try:
         hits = await keyword(query, limit=KEYWORD_SCAN, mind_id=mind_id,
                              mind_ids=mind_ids, unit=unit)
@@ -467,6 +468,12 @@ async def recall(*, query: str, embedding: Sequence[float],
         log.warning("hive-data: the keyword half of a recall failed; "
                     "answering on similarity alone", exc_info=True)
         hits = []
+        # And the answer says so. Reporting `"mode": "hybrid"` for a recall
+        # that ran on similarity alone makes the degradation invisible to
+        # everything except this one log line: the ranking changes, the
+        # answers get worse, and the field the caller would check to find
+        # out still reads hybrid.
+        mode = "vector"
     for row in hits:
         row = dict(row)
         rid = int(row["id"])
@@ -586,7 +593,7 @@ async def recall(*, query: str, embedding: Sequence[float],
         row["score"] = round(entry["cos"], 4)
         out.append(row)
 
-    return {"memories": out, "count": len(out), "mode": "hybrid",
+    return {"memories": out, "count": len(out), "mode": mode,
             "pool_size": len(pool_ids)}
 
 

@@ -42,7 +42,7 @@ from typing import Any, Mapping, Sequence
 
 from . import _sql
 from .core import _execute, _execute_returning, _fetch, _fetch_one
-from .errors import MissingReference, ValueRefused
+from .errors import MissingReference, StaleRead, ValueRefused
 from .rows import UNSET, as_row, as_rows
 from .schema import public as schema_public
 from .schema import qualified, select_list
@@ -98,34 +98,56 @@ def _blob(properties: Mapping[str, Any] | None) -> str:
 
 
 def _decoded(value: Any) -> dict[str, Any]:
-    """A properties blob as a dict, treating unreadable as empty.
+    """A properties blob as a dict. An unreadable one is a refusal.
 
-    A blob that will not parse is a row written by something else, and the
-    merge that reads it must not take the whole node down — but it must not
-    silently drop the keys either, which is why the raw text is kept on the
-    way back out.
+    Absent or empty is an empty blob, which is an ordinary node nobody has
+    put properties on yet.
+
+    Unreadable is not. This used to answer `{}` for a blob that would not
+    parse, and the merge above it then wrote that `{}` plus its own
+    additions back over the row — every other key on the node destroyed as
+    a side effect of adding one, and the caller told the merge landed. A
+    read-modify-write cannot modify what it could not read, so it refuses
+    and says which row.
     """
     if not value:
         return {}
     try:
         decoded = json.loads(value)
-    except (TypeError, ValueError):
-        return {}
-    return decoded if isinstance(decoded, dict) else {}
+    except (TypeError, ValueError) as exc:
+        raise ValueRefused(
+            f"this node's properties are not readable JSON, so a merge "
+            f"would overwrite them: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise ValueRefused(
+            "this node's properties are not a JSON object, so a merge "
+            f"would overwrite them: {type(decoded).__name__}")
+    return decoded
 
 
-def _node_key(owner: Any, type: str, name: str) -> str:
+def _node_key(type: str, name: str) -> str:
     """The advisory-lock key one node's writers serialize on.
 
-    Keyed by the triple the unique index is on, so two writers of one node
-    take turns and two writers of different nodes do not — the distinction
-    requirement seven is about. The triple is rendered as JSON rather than
-    joined on a separator: a NULL owner has to be distinguishable from the
-    literal string "None", and a name containing the separator must not be
-    able to collide with a different triple. No NUL byte, either — the key
-    crosses the wire as `text`, and Postgres refuses one outright.
+    Keyed by the type and the name, so two writers of one node take turns
+    and two writers of different nodes do not — the distinction requirement
+    seven is about. The pair is rendered as JSON rather than joined on a
+    separator: a name containing the separator must not be able to collide
+    with a different pair. No NUL byte, either — the key crosses the wire as
+    `text`, and Postgres refuses one outright.
+
+    The owner is deliberately *not* in the key, even though the unique index
+    is on the triple. The caller resolves which owner it is writing under by
+    reading the row first, and that read is outside this lock — so a key
+    including the owner is a key computed from state that can have moved. A
+    Mind node waits ownerless until its credential is minted and the
+    ownership pass then claims it, which is exactly a row whose owner
+    changes under a concurrent writer: the in-transaction existence check
+    below would miss it and insert a second node. Two people writing
+    same-named nodes of the same type now take turns where they need not,
+    which is a contention nobody will ever measure against a fork nobody
+    would ever find.
     """
-    return "memory.nodes:" + json.dumps([owner, type, name])
+    return "memory.nodes:" + json.dumps([type, name])
 
 
 async def node_write(*, owner: Any, type: str, name: str, mind_id: str,
@@ -164,7 +186,7 @@ async def node_write(*, owner: Any, type: str, name: str, mind_id: str,
         "owner": owner,
     })
     async with transaction() as unit:
-        await unit.hold(_node_key(owner, type, name))
+        await unit.hold(_node_key(type, name))
         existing = await unit.fetch_one(
             f'SELECT "id" FROM {qualified("memory.nodes")} '
             'WHERE "type" = $1 AND "name" = $2 '
@@ -433,7 +455,9 @@ async def soul_replace(*, node_id: int, properties: Mapping[str, Any],
                        reason: Any, before: Any, after: Any,
                        at: Any = UNSET,
                        as_of: Any = UNSET,
-                       updated_at: Any = UNSET) -> dict[str, Any]:
+                       updated_at: Any = UNSET,
+                       expected_change_count: int | None = None
+                       ) -> dict[str, Any]:
     """Replace a soul and record what it was, or do neither.
 
     `at` is the moment the caller stamped the change with, and it reaches
@@ -446,6 +470,19 @@ async def soul_replace(*, node_id: int, properties: Mapping[str, Any],
     properties. The SQLite original set all three together, and splitting
     them into a second call to keep this signature smaller would reintroduce
     exactly the non-atomicity this function exists to prevent.
+
+    `expected_change_count` is the compare-and-set, and it is checked *here*
+    rather than by the caller before calling. The caller reading the count
+    and then calling this was two transactions with nothing held between
+    them: two console saves both read the same count, both found it
+    matching, and both wrote — the second over the first, and both told the
+    operator their line landed. That is the one loss this whole pair exists
+    to prevent, so the check cannot live outside the unit that writes.
+
+    The node row is locked first. Counting `soul_changes` does not block
+    another session's insert into it, so the count read needs something
+    that serializes the writers — and every writer comes through here and
+    takes the same row lock before it counts.
 
     `record_against` exists for the test that proves the pair is atomic: the
     provenance row is written against that id rather than the node's own, so
@@ -460,12 +497,22 @@ async def soul_replace(*, node_id: int, properties: Mapping[str, Any],
     })
     sql, args = _sql.update("memory.nodes", node_values, {"id": node_id})
     async with transaction() as unit:
+        await unit.execute(
+            f'SELECT "id" FROM {qualified("memory.nodes")} '
+            'WHERE "id" = $1 FOR UPDATE', node_id)
+        count = await soul_change_count(node_id=node_id, unit=unit)
+        if (expected_change_count is not None
+                and expected_change_count != count):
+            raise StaleRead(
+                f"soul {node_id} has {count} changes, not "
+                f"{expected_change_count}",
+                expected=expected_change_count, observed=count)
         await unit.execute(sql, *args)
         await soul_change_record(
             node_id=against, mind_name=mind_name, mind_id=mind_id,
             actor=actor, reason=reason, before=before, after=after,
             at=at, unit=unit)
-        return {"rows": 1, "node_id": node_id}
+        return {"rows": 1, "node_id": node_id, "change_count": count + 1}
 
 
 async def soul_history(*, node_id: int, limit: int = 50,
