@@ -38,16 +38,20 @@ async def _session(mind_id: str, clock: float, *, surface: str = "telegram",
 async def test_a_picker_is_offered_what_other_surfaces_hold_and_not_its_own(
         a_mind, clock):
     """The adoptable half of a picker: conversations on the adoptable
-    surfaces held at any address but the asking one."""
+    surfaces held at any address but the asking one. A conversation held
+    elsewhere on a surface nobody adopts from is not offered."""
     mine = await _session(a_mind, clock, surface="web", surface_id="me")
     theirs = await _session(a_mind, clock, surface="terminal",
                             surface_id="terminal-x")
+    errand = await _session(a_mind, clock, surface="broker",
+                            surface_id="elsewhere")
 
     found = await sessions_ops.find_sessions(
         surfaces=["web", "terminal"], surface_id_not="me", mind_id=a_mind)
 
     assert [row["id"] for row in found] == [theirs]
     assert mine not in [row["id"] for row in found]
+    assert errand not in [row["id"] for row in found]
 
 
 async def test_the_live_view_lists_only_bound_unretired_sessions_newest_first(
@@ -152,11 +156,18 @@ async def test_a_report_that_measured_nothing_fills_a_row_with_no_size(
             row["context_observed_at"]) == (0, "none", clock + 60)
 
 
-async def test_a_report_for_a_session_that_is_gone_changes_no_row(connected):
+async def test_a_report_for_a_session_that_is_gone_changes_no_row(
+        a_mind, clock, inspector):
+    other = await _session(a_mind, clock)
+
     result = await sessions_ops.record_unmeasured_context(
-        _id("gone"), observed_at=1.0, tokens=0)
+        _id("gone"), observed_at=clock + 60, tokens=0, window=200_000)
 
     assert result["rows"] == 0
+    row = await inspector.fetchrow(
+        "SELECT context_tokens, context_kind, context_observed_at, "
+        "context_window FROM core.sessions WHERE id = $1", other)
+    assert tuple(row) == (None, None, None, None)
 
 
 # ------------------------------------------------------------ carry-forward
@@ -188,12 +199,25 @@ async def test_a_codex_turn_naming_its_own_thread_clears_the_seed(
         session_id, carry_forward="seed",
         carry_forward_sid=row["conversation_id"], carry_forward_at=clock)
 
+    # The same thread name on a row whose seed was composed for some other
+    # conversation: the thread is not the one that seed is waiting for.
+    elsewhere = await _session(a_mind, clock, harness_sid="codex-thread",
+                               carry_forward="other seed",
+                               carry_forward_sid=_id("conv"),
+                               carry_forward_at=clock)
+
     await sessions_ops.clear_carry_forward(session_id, typed_into="codex-thread")
+    kept = await sessions_ops.clear_carry_forward(
+        elsewhere, typed_into="codex-thread")
 
     cleared = await inspector.fetchrow(
         "SELECT carry_forward, carry_forward_sid, carry_forward_at "
         "FROM core.sessions WHERE id = $1", session_id)
     assert tuple(cleared) == (None, None, None)
+    assert kept["rows"] == 0
+    assert await inspector.fetchval(
+        "SELECT carry_forward FROM core.sessions WHERE id = $1",
+        elsewhere) == "other seed"
 
 
 async def test_an_unscoped_turn_clears_whatever_seed_is_stored(
@@ -246,14 +270,23 @@ async def test_session_memory_answers_with_the_newest_under_either_id(
 
 
 async def test_the_last_turns_are_the_newest_in_the_order_they_were_said(
-        a_mind, clock):
+        a_mind, clock, inspector):
     """Two turns in one second are told apart by identity, or the mind
     appears to answer before it was asked."""
     session_id = await _session(a_mind, clock)
     for role, content in (("user", "first"), ("assistant", "one"),
                           ("user", "second"), ("assistant", "two")):
         await core.record_turn(session_id=session_id, role=role,
-                               content=content, created_at=clock)
+                               content=content, created_at=clock - 1)
+    # Moved onto one second newest identity first, so the rows now lie -
+    # in the table and in the (session_id, created_at) index alike - in the
+    # reverse of the order they were said. An order that leaned on how the
+    # rows happen to lie instead of on identity reads them backwards.
+    for content in ("two", "second", "one", "first"):
+        await inspector.execute(
+            "UPDATE core.session_turns SET created_at = $3 "
+            "WHERE session_id = $1 AND content = $2",
+            session_id, content, clock)
 
     turns = await sessions_ops.last_turns(session_id, 2)
 

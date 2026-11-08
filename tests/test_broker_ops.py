@@ -99,6 +99,11 @@ async def test_updating_a_mind_never_resurrects_a_deleted_one(
 
 async def test_updating_a_mind_sets_only_what_was_passed(
         connected, inspector, a_mind):
+    """`None` clears a column; a column not named is left alone."""
+    await inspector.execute(
+        'UPDATE core."minds" SET voice = $2 WHERE mind_id = $1',
+        a_mind, "am_adam")
+
     await broker_ops.update_mind(a_mind, owner="daniel", voice=None)
 
     row = await inspector.fetchrow(
@@ -118,11 +123,12 @@ async def test_a_minds_identity_and_first_registration_are_not_settable(
 
 async def test_a_mind_with_conversations_refuses_deletion(
         connected, inspector, a_mind, clock):
-    await core.create_session(
-        id=_name("s-"), surface="telegram", surface_id="1", mind_id=a_mind,
-        created_at=clock, last_active=clock)
+    for _ in range(2):
+        await core.create_session(
+            id=_name("s-"), surface="telegram", surface_id="1",
+            mind_id=a_mind, created_at=clock, last_active=clock)
 
-    assert await broker_ops.count_mind_sessions(a_mind) == 1
+    assert await broker_ops.count_mind_sessions(a_mind) == 2
     with pytest.raises(MissingReference):
         await broker_ops.delete_mind(a_mind)
     assert await inspector.fetchval(
