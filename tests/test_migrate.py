@@ -49,7 +49,7 @@ async def test_an_empty_database_gets_every_declared_table_and_a_second_apply_ke
         first = await migrate.apply(dsn)
         assert await _missing_tables(dsn) == []
         assert {schema_of(t) for t in COLUMNS} == {
-            "core", "memory", "tools", "board"}
+            "core", "memory", "tools", "board", "staff"}
         assert first["applied"] == [s.version for s in migrate.steps()]
 
         connection = await asyncpg.connect(dsn)

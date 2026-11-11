@@ -471,7 +471,11 @@ thing run on a hive that has the rest.
 
 ## Scope
 
-This package covers the `core`, `memory`, `tools` and `board` schemas.
+This package covers the `core`, `memory`, `tools`, `board` and `staff`
+schemas. `staff` (step 6) is the chief of staff's ledger: `staff.tasks`, a
+`staff.statuses` lookup its status is a foreign key into, and
+`staff.task_sessions` pairing a task with the `core.sessions` ids working it.
+`hive_data.staff` is the only way the chief of staff and its tick reach it.
 
 Two things are deliberately outside it. **hive-health** is not part of the one
 database at all. The **inference proxy** keeps SQLAlchemy and its own store:
