@@ -12,6 +12,12 @@ SELECT pg_catalog.set_config('search_path', '', false);
 
 CREATE SCHEMA staff;
 
+--
+-- What a name made only of whitespace looks like, Unicode included: a
+-- no-break space or a zero-width space reads as blank on every surface the
+-- ledger is shown on, and `btrim` strips neither.
+--
+
 COMMENT ON SCHEMA staff IS 'The chief of staff''s ledger: tasks it watches and the sessions working them.';
 
 --
@@ -22,7 +28,7 @@ COMMENT ON SCHEMA staff IS 'The chief of staff''s ledger: tasks it watches and t
 CREATE TABLE staff.statuses (
     name text NOT NULL,
     CONSTRAINT statuses_pkey PRIMARY KEY (name),
-    CONSTRAINT statuses_name_not_blank CHECK (btrim(name) <> '')
+    CONSTRAINT statuses_name_not_blank CHECK (name !~ '^[\s\u001c-\u001f\u0085\u00a0\u1680\u180e\u2000-\u200d\u2028\u2029\u202f\u205f\u2060\u3000\ufeff]*$')
 );
 
 INSERT INTO staff.statuses (name) VALUES
@@ -36,7 +42,8 @@ CREATE TABLE staff.tasks (
     created_at double precision NOT NULL,
     updated_at double precision NOT NULL,
     CONSTRAINT tasks_pkey PRIMARY KEY (id),
-    CONSTRAINT tasks_name_not_blank CHECK (btrim(name) <> ''),
+    CONSTRAINT tasks_id_not_blank CHECK (id !~ '^[\s\u001c-\u001f\u0085\u00a0\u1680\u180e\u2000-\u200d\u2028\u2029\u202f\u205f\u2060\u3000\ufeff]*$'),
+    CONSTRAINT tasks_name_not_blank CHECK (name !~ '^[\s\u001c-\u001f\u0085\u00a0\u1680\u180e\u2000-\u200d\u2028\u2029\u202f\u205f\u2060\u3000\ufeff]*$'),
     -- ON UPDATE CASCADE so renaming a status relabels its tasks; RESTRICT on
     -- delete so a status still in use cannot vanish from under them.
     CONSTRAINT tasks_status_fk_statuses FOREIGN KEY (status)
@@ -53,19 +60,21 @@ CREATE INDEX tasks_status_idx ON staff.tasks USING btree (status);
 --
 -- The session is `core.sessions.id`: the hive-comms session id, permanent
 -- across rotations (a rotation rewrites the row's conversation id, never
--- its id). The only thing that removes it is the conversation being ended,
--- and the pair goes with it - RESTRICT here would make ending a
--- conversation that a task is watching fail inside comms.
+-- its id), text as it is there. Deliberately NOT a foreign key. Comms
+-- deletes a session row whenever a conversation ends (/new, /clear, /prune,
+-- broker cleanup), and the ledger's record that a session worked a task must
+-- survive that: no ON DELETE action both keeps this row and lets the session
+-- go. A paired id with no `core.sessions` row is a session that has ended,
+-- and that is how the tick reads it.
 --
 CREATE TABLE staff.task_sessions (
     session_id text NOT NULL,
     task_id text NOT NULL,
     attached_at double precision NOT NULL,
     CONSTRAINT task_sessions_pkey PRIMARY KEY (session_id),
+    CONSTRAINT task_sessions_session_id_not_blank CHECK (session_id !~ '^[\s\u001c-\u001f\u0085\u00a0\u1680\u180e\u2000-\u200d\u2028\u2029\u202f\u205f\u2060\u3000\ufeff]*$'),
     CONSTRAINT task_sessions_task_id_fk_tasks FOREIGN KEY (task_id)
-        REFERENCES staff.tasks(id) ON DELETE CASCADE,
-    CONSTRAINT task_sessions_session_id_fk_sessions FOREIGN KEY (session_id)
-        REFERENCES core.sessions(id) ON DELETE CASCADE
+        REFERENCES staff.tasks(id) ON DELETE CASCADE
 );
 
 CREATE INDEX task_sessions_task_id_idx ON staff.task_sessions USING btree (task_id);
