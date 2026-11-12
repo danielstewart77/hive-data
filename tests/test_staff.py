@@ -140,3 +140,38 @@ async def test_a_status_not_in_the_lookup_is_refused_and_the_task_is_unchanged(
         made["id"])
     assert dict(stored) == {"name": "Watch this", "status": "on hold",
                             "updated_at": clock}
+
+
+async def test_deleting_a_task_removes_it_and_its_pairs_and_leaves_others(
+        connected, inspector, a_mind, clock):
+    doomed = await staff.create_task("Opened in error", "in progress",
+                                     now=clock)
+    kept = await staff.create_task("Real work", "in progress", now=clock)
+    session_id = await _session(a_mind, clock)
+    await staff.attach_session(doomed["id"], session_id, now=clock)
+
+    out = await staff.delete_task(doomed["id"])
+
+    assert out["rows"] == 1
+    assert await staff.task(doomed["id"]) is None
+    assert await inspector.fetchval(
+        "SELECT count(*) FROM staff.task_sessions WHERE session_id = $1",
+        session_id) == 0
+    assert (await staff.task(kept["id"]))["name"] == "Real work"
+    assert (await staff.delete_task(doomed["id"]))["rows"] == 0
+
+
+async def test_the_staff_role_reaches_the_ledger_and_no_other_schema(
+        connected, inspector, clock):
+    made = await staff.create_task("Visible to the chief", "in progress",
+                                   now=clock)
+    async with inspector.transaction():
+        await inspector.execute("SET LOCAL ROLE hive_staff")
+        assert await inspector.fetchval(
+            "SELECT name FROM staff.tasks WHERE id = $1",
+            made["id"]) == "Visible to the chief"
+        await inspector.execute(
+            "UPDATE staff.tasks SET status = 'on hold' WHERE id = $1",
+            made["id"])
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await inspector.fetch("SELECT 1 FROM core.sessions LIMIT 1")
