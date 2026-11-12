@@ -475,7 +475,11 @@ thing run on a hive that has the rest.
 ## The chief of staff's role
 
 Step 7 makes `hive_staff`, a NOLOGIN role that may connect, use the `staff`
-schema and read and write its tables, and reach nothing else. The chief of
+schema and read and write its tables, and read or write no other schema's
+tables. It keeps what every role has from PUBLIC (CONNECT and TEMP, unless
+the server revoked them). The database's CONNECT grant needs a migrator that
+owns the database; for one that does not, Postgres reduces it to a warning
+and PUBLIC's CONNECT is what lets the login in. The chief of
 staff holds the hive's widest reach over conversations, so its database
 credential is the narrowest one there is. The login carrying a password is
 not in a step — a role is cluster-wide and a password is not a tracked
@@ -486,7 +490,9 @@ on stdin so the password stays off every command line:
 CREATE ROLE stash LOGIN PASSWORD '<generated>' IN ROLE hive_staff;
 ```
 
-Its URL is that mind's `HIVE_DATABASE_URL`. That role sees only `staff`, so
+Its URL is that mind's `HIVE_DATABASE_URL`; for the hive's `stash`
+container, `STASH_DATABASE_URL` in hive_mind's `.env`, which its compose
+fragment passes in. That role sees only `staff`, so
 `hive_data.connect()`'s schema check, which reads every schema, is passed
 `verify=False` by a process connecting as it.
 

@@ -165,7 +165,19 @@ async def test_the_staff_role_reaches_the_ledger_and_no_other_schema(
         connected, inspector, clock):
     made = await staff.create_task("Visible to the chief", "in progress",
                                    now=clock)
-    async with inspector.transaction():
+    assert await inspector.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_database d, "
+        "aclexplode(d.datacl) a WHERE d.datname = current_database() "
+        "AND a.grantee = 'hive_staff'::regrole AND a.privilege_type = "
+        "'CONNECT')")
+    # Rolled back at the end, so nothing the probe makes outlives it.
+    outer = inspector.transaction()
+    await outer.start()
+    try:
+        # Made by the migrating role, as a later step's table would be.
+        await inspector.execute(
+            "CREATE TABLE staff.later_table (x int); "
+            "INSERT INTO staff.later_table VALUES (1)")
         await inspector.execute("SET LOCAL ROLE hive_staff")
         assert await inspector.fetchval(
             "SELECT name FROM staff.tasks WHERE id = $1",
@@ -173,5 +185,20 @@ async def test_the_staff_role_reaches_the_ledger_and_no_other_schema(
         await inspector.execute(
             "UPDATE staff.tasks SET status = 'on hold' WHERE id = $1",
             made["id"])
-        with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            await inspector.fetch("SELECT 1 FROM core.sessions LIMIT 1")
+        await inspector.execute(
+            "INSERT INTO staff.tasks (id, name, status, created_at, "
+            "updated_at) VALUES ('by-the-chief', 'x', 'done', 0, 0)")
+        assert await inspector.execute(
+            "DELETE FROM staff.tasks WHERE id = 'by-the-chief'") == "DELETE 1"
+        assert await inspector.fetchval(
+            "SELECT x FROM staff.later_table") == 1
+        refused = [f"SELECT 1 FROM {table} LIMIT 1" for table in (
+            "core.sessions", "tools.users", "board.work_items",
+            "memory.memories")] + ["CREATE TABLE staff.mine (x int)"]
+        for statement in refused:
+            # The savepoint rolls back the refusal, so the next one is read.
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with inspector.transaction():
+                    await inspector.execute(statement)
+    finally:
+        await outer.rollback()
