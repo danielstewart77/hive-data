@@ -132,8 +132,10 @@ COLUMNS: dict[str, tuple[str, ...]] = {
         "created_at"),
     #: Role Management (step 16, feature 10.18).
     "board.roles": (
-        "id", "slug", "name", "skills", "hooks", "model", "tools",
-        "kept_against", "created_at", "updated_at"),
+        "id", "slug", "name", "skills", "hooks", "tools",
+        "kept_against", "created_at", "updated_at",
+        #: The model tier a role suggests (step 18): advice, never a rule.
+        "suggested_tier"),
     "board.managed_minds": ("mind_id", "managed_at"),
     "board.mind_roles": ("mind_id", "role_id", "assigned_at"),
     "board.skill_submissions": (
